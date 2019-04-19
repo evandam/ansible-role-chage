@@ -3,6 +3,7 @@
 
 # (c) 2012, Michael DeHaan <michael.dehaan@gmail.com>, and others
 # (c) 2016, Toshio Kuratomi <tkuratomi@ansible.com>
+# (c) 2019, Evan Van Dam <evandam92@gmail.com>
 #
 # This file is part of Ansible
 #
@@ -42,77 +43,97 @@ EXAMPLES = '''
 [...]
 '''
 
-import sys
-import glob
-import shlex
-import os
-import json
-import random
-import string
+from datetime import datetime
+from ansible.module_utils.basic import AnsibleModule
 
-args_file = sys.argv[1]
-args_data = file(args_file).read()
-args = shlex.split(args_data)
 
-executable = "chage"
-clargs = dict()
-argnames = {
-  "password_last_changed": "lastday",
-  "account_expires": "expiredate",
-  "inactive_days": "inactive",
-  "password_minimum_days": "mindays",
-  "password_maximum_days": "maxdays",
-  "password_warn_days": "warndays",
-}
-user = False
+CHAGE_DATE_FORMAT = '%b %d, %Y'
 
-for arg in args:
-    # ignore any arguments without an equals in it
-    if "=" in arg:
-        (key, value) = arg.split("=")
-        if key == 'user':
-            user = value
-        else:
-            keyname = argnames.get(key, False)
-            if keyname != False:
-                if value == 'False':
-                    clargs[keyname] = '-1'
-                else:
-                    clargs[keyname] = value
 
-if user == False:
-    print json.dumps({
-        "failed" : True,
-        "msg"    : "You need to select a user to manage"
-    })
-    sys.exit(1)
+def run_chage(module, user, **kwargs):
+    param_map = {
+        'last_day': '--lastday',
+        'expire_date': '--expiredate',
+        'inactive': '--inactive',
+        'min_days': '--mindays',
+        'max_days': '--maxdays',
+        'warn_days': '--warndays',
+    }
+    chage_args = ['chage', user]
+    for key, val in kwargs:
+        if val is not None:
+            chage_args += [param_map[key], val]
+    module.run_command(chage_args, check_rc=True)    
 
-def chage_check(user):
-  filename = ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(32))
-  os.system('chage -l "%s" > %s' % (user, filename))
-  return open(filename, 'r').read()
 
-before = chage_check(user)
+def check_chage(module, user, target_vals):
+    """Check if the chage values match the target values"""
+    rc, out, err = module.run_command(['chage', '-l', user], check_rc=True)
+    pairs = (x.split(':') for x in out.strip().split('\n'))
+    vals = dict((k.strip(), v.strip()) for k, v in pairs)
 
-arguments = list()
-for key, val in clargs.items():
-    arguments.append("--%s %s" % (key, val))
+    def _parse_chage_date(d):
+        if d == 'never':
+            return -1
+        return datetime.strptime(d, CHAGE_DATE_FORMAT)
 
-command = executable + ' ' + ' '.join(arguments) + ' ' + user
-rc = os.system(command)
+    chage = dict(
+        last_password_change=_parse_chage_date(vals['Last password change']),
+        password_expire=_parse_chage_date(vals['Password expires']),
+        password_inactive=_parse_chage_date(vals['Password inactive']),
+        account_expire=_parse_chage_date(vals['Account expires']),
+        min_days=int(vals['Minimum number of days between password change']),
+        max_days=int(vals['Maximum number of days between password change']),
+        warn_days=int(vals['Number of days of warning before password expires']),
+    )
 
-if rc != 0:
-    print json.dumps({
-        "failed" : True,
-        "msg"    : "Failed setting the expiry attributes",
-        "command": command
-    })
-    sys.exit(1)
+    return all([
+        target_vals['last_day'] is None or chage['last_password_change'] == target_vals['last_day'],
+        target_vals['expire_date'] is None or chage['account_expire'] == target_vals['expire_date'],
+        target_vals['min_days'] is None or chage['min_days'] == target_vals['min_days'],
+        target_vals['max_days'] is None or chage['max_days'] == target_vals['max_days'],
+        target_vals['warn_days'] is None or chage['warn_days'] == target_vals['warn_days'],
+    ])
 
-changed = before != chage_check(user)
 
-print json.dumps({
-    "changed": changed,
-    "command": command
-})
-sys.exit(0)
+
+def run_module():
+    """Run the Ansible module"""
+    def datetype(d):
+        if d in (-1, 'never'):
+            return -1
+        return datetime.strptime(d, '%Y-%m-%d').date()
+
+    module_args = dict(
+        user=dict(required=True),
+        last_day=dict(required=False, type=datetype),
+        expire_date=dict(required=False, type=datetype),
+        inactive=dict(required=False,),
+        min_days=dict(required=False, type=int),
+        max_days=dict(required=False, type=int),
+        warn_days=dict(required=False, type=int),
+    )
+
+    result = dict(
+        changed=False,
+    )
+
+    module = AnsibleModule(
+        argument_spec=module_args,
+        supports_check_mode=True
+    )
+
+    needs_change = check_chage(module, module.args)
+
+    if needs_change:
+        result['changed'] = True
+        if not module.check_mode:
+            run_chage(module, module.args)
+
+
+def _main():
+    run_module()
+
+
+if __name__ == '__main__':
+    _main()
